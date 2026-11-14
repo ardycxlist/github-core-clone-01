@@ -5,15 +5,15 @@
 
 import { createServer } from "node:http";
 import type { IncomingMessage, ServerResponse } from "node:http";
-import { Store, trialNowIso } from "./store.js";
-import type { Repo } from "./store.js";
+import { Store, trialNowIso } from "./store.ts";
+import type { Repo } from "./store.ts";
 import {
   AGENT,
   buildV0Advertisement,
   buildV2Advertisement,
   handleReceivePack,
   handleUploadPackPost,
-} from "./git.js";
+} from "./git.ts";
 
 export interface Forge {
   server: ReturnType<typeof createServer>;

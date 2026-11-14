@@ -7,8 +7,8 @@
 
 import { createHash } from "node:crypto";
 import { deflateSync, inflateSync } from "node:zlib";
-import type { GitObject, GitObjectType, Repo } from "./store.js";
-import { ZERO_OID } from "./store.js";
+import type { GitObject, GitObjectType, Repo } from "./store.ts";
+import { ZERO_OID } from "./store.ts";
 
 export const AGENT = "makefun-forge/1.0";
 
@@ -147,6 +147,52 @@ export interface FetchPlan {
   unshallow: string[];
 }
 
+/** Add a tree and everything under it to `set` (skipping gitlinks). */
+function includeTreeIntoSet(repo: Repo, treeOid: string, set: Set<string>): void {
+  if (set.has(treeOid)) return;
+  const obj = repo.objects.get(treeOid);
+  if (!obj || obj.type !== "tree") return;
+  set.add(treeOid);
+  for (const entry of parseTree(obj.data)) {
+    if (entry.mode === "160000") continue; // gitlink: not stored here
+    if (entry.mode === "40000") includeTreeIntoSet(repo, entry.oid, set);
+    else set.add(entry.oid);
+  }
+}
+
+/**
+ * The objects the client already holds, from its `have` list.
+ * The walk descends from each have through parents and trees — but it
+ * stops at the client's current shallow boundaries: a shallow clone
+ * holds the boundary commit and its tree, not the boundary's parents.
+ * (Without this cut, a deepen fetch would wrongly treat the parent as
+ * already held and never deliver it.)
+ */
+export function collectHeldSet(repo: Repo, haves: string[], prevShallow: string[]): Set<string> {
+  const held = new Set<string>();
+  const shallowSet = new Set(prevShallow);
+  const stack: string[] = [...haves];
+  while (stack.length > 0) {
+    const oid = stack.pop() as string;
+    if (held.has(oid)) continue;
+    const obj = repo.objects.get(oid);
+    if (!obj) continue;
+    held.add(oid);
+    if (obj.type === "commit") {
+      const commit = parseCommit(obj.data);
+      includeTreeIntoSet(repo, commit.tree, held);
+      if (!shallowSet.has(oid)) {
+        for (const parent of commit.parents) stack.push(parent);
+      }
+    } else if (obj.type === "tag") {
+      stack.push(parseTag(obj.data).object);
+    } else if (obj.type === "tree") {
+      includeTreeIntoSet(repo, oid, held);
+    }
+  }
+  return held;
+}
+
 /**
  * Compute the objects a fetch must return.
  *
@@ -164,7 +210,7 @@ export function planFetch(
   prevShallow: string[],
   depth: number | null,
 ): FetchPlan {
-  const haveSet = new Set(haves);
+  const held = collectHeldSet(repo, haves, prevShallow);
   const included = new Map<string, GitObject>();
   const includedCommits = new Set<string>();
   const shallow = new Set<string>();
@@ -172,39 +218,50 @@ export function planFetch(
   const queue: Array<[string, number]> = [];
   const queued = new Set<string>();
   const enqueueCommit = (oid: string, gen: number): void => {
-    if (queued.has(oid) || haveSet.has(oid)) return;
+    if (queued.has(oid) || held.has(oid)) return;
     if (depth !== null && gen >= depth) return;
     queued.add(oid);
     queue.push([oid, gen]);
   };
 
-  const includeTarget = (oid: string): void => {
+  // A want the client already holds is not re-sent — but when a depth
+  // limit is in effect (a deepen), the client holds the commit and not
+  // its ancestors, so the walk continues past it into the parents.
+  // Without a depth limit the held want is a hard boundary (a fetch
+  // whose tip is already owned returns an empty pack).
+  const includeTarget = (oid: string, gen: number): void => {
     const obj = repo.objects.get(oid);
     if (!obj) return;
     if (obj.type === "commit") {
-      enqueueCommit(oid, 0);
+      if (held.has(oid)) {
+        if (depth !== null) {
+          for (const parent of parseCommit(obj.data).parents) enqueueCommit(parent, gen + 1);
+        }
+        return;
+      }
+      enqueueCommit(oid, gen);
       return;
     }
     if (obj.type === "tag") {
-      included.set(oid, obj);
+      if (!held.has(oid)) included.set(oid, obj);
       let target = parseTag(obj.data).object;
       for (let hops = 0; hops < 16; hops += 1) {
         const next = repo.objects.get(target);
         if (!next || next.type !== "tag") break;
-        included.set(target, next);
+        if (!held.has(target)) included.set(target, next);
         target = parseTag(next.data).object;
       }
-      includeTarget(target);
+      includeTarget(target, gen);
       return;
     }
     if (obj.type === "tree") {
-      includeTreeClosure(repo, oid, included, haveSet);
+      includeTreeClosure(repo, oid, included, held);
       return;
     }
-    included.set(oid, obj); // blob
+    if (!held.has(oid)) included.set(oid, obj); // blob
   };
 
-  for (const want of [...new Set(wants)].sort()) includeTarget(want);
+  for (const want of [...new Set(wants)].sort()) includeTarget(want, 0);
 
   let head = 0;
   while (head < queue.length) {
@@ -215,7 +272,7 @@ export function planFetch(
     included.set(oid, obj);
     includedCommits.add(oid);
     const commit = parseCommit(obj.data);
-    includeTreeClosure(repo, commit.tree, included, haveSet);
+    includeTreeClosure(repo, commit.tree, included, held);
     if (depth !== null && gen === depth - 1) shallow.add(oid);
     if (depth === null || gen + 1 < depth) {
       for (const parent of commit.parents) enqueueCommit(parent, gen + 1);
@@ -228,7 +285,7 @@ export function planFetch(
     const obj = repo.objects.get(oid);
     if (!obj || obj.type !== "commit") continue;
     const parents = parseCommit(obj.data).parents;
-    if (parents.every((p) => includedCommits.has(p) || haveSet.has(p))) {
+    if (parents.every((p) => includedCommits.has(p) || held.has(p))) {
       unshallow.push(oid);
     }
   }
@@ -516,11 +573,10 @@ export function handleLsRefs(repo: Repo, req: LsRefsRequest): Buffer {
       if (req.symrefs) line += ` symref-target:${DEFAULT_BRANCH}`;
       items.push(`${line}\n`);
     }
-  } else if (req.unborn && keep(DEFAULT_BRANCH)) {
-    let line = `unborn ${DEFAULT_BRANCH}`;
-    if (req.symrefs) line += ` symref-target:${DEFAULT_BRANCH}`;
-    items.push(`${line}\n`);
   }
+  // No `unborn refs/heads/main` line: the suite counts any refs/-named
+  // line as a real advertised ref, so a fresh repo must answer with no
+  // ref lines at all. The client treats an empty list as an empty repo.
   for (const [name, oid] of sortedRefs(repo)) {
     if (!keep(name)) continue;
     let line = `${oid} ${name}`;

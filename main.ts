@@ -13,8 +13,8 @@
 // The forge code lives in app.ts / git.ts / store.ts; this file only runs
 // the lifecycle.
 
-import { Store } from "./store.js";
-import { createForge } from "./app.js";
+import { Store } from "./store.ts";
+import { createForge } from "./app.ts";
 
 const ENV_URL = (process.env.MAKEFUN_ENV_URL ?? "").replace(/\/+$/, "");
 if (ENV_URL === "") {

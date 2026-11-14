@@ -1,7 +1,7 @@
 // store.ts — deterministic state for the forge.
 //
 // Determinism rules (non-negotiable):
-//   - No Date.now(), no new Date(), no Math.random() anywhere in forge code.
+//   - No wall-clock reads and no unseeded random anywhere in forge code.
 //   - All timestamps come from MAKEFUN_TRIAL_NOW (an ISO string the trial
 //     sets) or a fixed epoch when the variable is absent (local dev).
 //   - All ids come from sequential counters.
@@ -28,13 +28,37 @@ export interface Repo {
   createdSeq: number;
 }
 
+/**
+ * Days since 1970-01-01 for a civil date (Howard Hinnant's algorithm).
+ * Pure integer arithmetic — no Date object anywhere in the forge.
+ */
+function daysFromCivil(year: number, month: number, day: number): number {
+  const y = month <= 2 ? year - 1 : year;
+  const era = Math.floor(y / 400);
+  const yoe = y - era * 400;
+  const mp = month > 2 ? month - 3 : month + 9;
+  const doy = Math.floor((153 * mp + 2) / 5) + day - 1;
+  const doe = yoe * 365 + Math.floor(yoe / 4) - Math.floor(yoe / 100) + doy;
+  return era * 146097 + doe - 719468;
+}
+
+const TRIAL_NOW_ISO = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.\d+)?Z$/;
+
 function parseTrialNow(): { iso: string; epochSec: number } {
   const raw = process.env.MAKEFUN_TRIAL_NOW;
   if (raw) {
-    const ms = Date.parse(raw);
-    if (Number.isFinite(ms)) {
-      const iso = new Date(ms).toISOString().replace(/\.\d{3}Z$/, "Z");
-      return { iso, epochSec: Math.floor(ms / 1000) };
+    const m = TRIAL_NOW_ISO.exec(raw);
+    if (m) {
+      const year = Number(m[1]);
+      const month = Number(m[2]);
+      const day = Number(m[3]);
+      const hour = Number(m[4]);
+      const minute = Number(m[5]);
+      const second = Number(m[6]);
+      const epochSec =
+        daysFromCivil(year, month, day) * 86400 + hour * 3600 + minute * 60 + second;
+      const iso = `${m[1]}-${m[2]}-${m[3]}T${m[4]}:${m[5]}:${m[6]}Z`;
+      return { iso, epochSec };
     }
   }
   return { iso: "2026-01-01T00:00:00Z", epochSec: 1767225600 };
