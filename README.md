@@ -20,10 +20,15 @@ Without `MAKEFUN_ENV_URL` it exits 1.
 ## Layout
 
 - `main.ts` — entry <-> env lifecycle (bind, register, wait for done).
-- `app.ts` — HTTP server: routing, git smart HTTP, minimal REST v3, healthz.
+- `app.ts` — HTTP server: routing, git smart HTTP, REST v3 dispatch, healthz.
+- `rest.ts` — full REST v3 (`/api/v3`): repos, branches, commits, contents,
+  labels, issues, pull requests, deterministic squash merge.
+- `http-util.ts` — shared HTTP plumbing: JSON replies, request ids, auth, errors.
 - `git.ts` — git object model, pkt-line codec, pack codec (plain objects
-  only), protocol v2 ls-refs / fetch, protocol v0 receive-pack.
-- `store.ts` — deterministic in-memory state (repos, objects, refs).
+  only), protocol v2 ls-refs / fetch, protocol v0 receive-pack, plus tree /
+  commit / merge helpers for the REST surface.
+- `store.ts` — deterministic in-memory state (repos, objects, refs, labels,
+  issues, pulls).
 
 ## Determinism
 
