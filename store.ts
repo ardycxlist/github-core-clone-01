@@ -16,6 +16,49 @@ export interface GitObject {
   data: Buffer;
 }
 
+export interface Label {
+  id: number;
+  name: string;
+  color: string;
+  description: string;
+}
+
+export interface IssueComment {
+  id: number;
+  body: string;
+  userLogin: string;
+  createdSeq: number;
+}
+
+export interface Issue {
+  id: number;
+  number: number;
+  title: string;
+  body: string;
+  state: "open" | "closed";
+  labels: Label[];
+  comments: IssueComment[];
+  createdSeq: number;
+  userLogin: string;
+}
+
+export interface Pull {
+  id: number;
+  number: number;
+  title: string;
+  body: string;
+  state: "open" | "closed";
+  headRef: string;
+  headSha: string;
+  baseRef: string;
+  baseSha: string;
+  merged: boolean;
+  mergedAt: string | null;
+  mergeCommitSha: string | null;
+  createdSeq: number;
+  userLogin: string;
+}
+
 export interface Repo {
   id: number;
   name: string;
@@ -26,6 +69,11 @@ export interface Repo {
   objects: Map<string, GitObject>;
   refs: Map<string, string>; // ref name -> oid
   createdSeq: number;
+  labels: Map<string, Label>;
+  issues: Map<number, Issue>;
+  pulls: Map<number, Pull>;
+  /** Next issue/PR number (one shared counter, GitHub semantics). */
+  numberSeq: number;
 }
 
 /**
@@ -85,11 +133,18 @@ export class Store {
   reposByName = new Map<string, Repo>();
   private repoSeq = 10000;
   private requestSeq = 0;
+  private seq = 0;
 
   /** Next deterministic request id (X-GitHub-Request-Id header). */
   nextRequestId(): string {
     this.requestSeq += 1;
     return `req-${this.requestSeq}`;
+  }
+
+  /** Next deterministic sequence number (creation order, ids). */
+  nextSeq(): number {
+    this.seq += 1;
+    return this.seq;
   }
 
   createRepo(name: string, description: string, isPrivate: boolean): Repo {
@@ -103,6 +158,10 @@ export class Store {
       objects: new Map(),
       refs: new Map(),
       createdSeq: this.repoSeq,
+      labels: new Map(),
+      issues: new Map(),
+      pulls: new Map(),
+      numberSeq: 1,
     };
     this.repoSeq += 1;
     this.reposByName.set(name, repo);

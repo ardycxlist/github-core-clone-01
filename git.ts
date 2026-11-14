@@ -792,3 +792,232 @@ export function handleUploadPackPost(repo: Repo, body: Buffer): UploadPackResult
     contentType: "text/plain",
   };
 }
+
+// ---------------------------------------------------------------------------
+// Tree / commit helpers for the REST v3 surface (contents API, squash merge)
+// ---------------------------------------------------------------------------
+
+export interface FlatEntry {
+  mode: string;
+  oid: string;
+}
+
+/** Flatten a tree into path -> {mode, oid} (recursive). */
+export function flattenTree(repo: Repo, treeOid: string): Map<string, FlatEntry> {
+  const out = new Map<string, FlatEntry>();
+  const walk = (oid: string, prefix: string): void => {
+    const obj = repo.objects.get(oid);
+    if (!obj || obj.type !== "tree") return;
+    for (const entry of parseTree(obj.data)) {
+      const path = prefix === "" ? entry.name : `${prefix}/${entry.name}`;
+      if (entry.mode === "40000") walk(entry.oid, path);
+      else if (entry.mode === "160000") continue; // gitlink: not stored here
+      else out.set(path, { mode: entry.mode, oid: entry.oid });
+    }
+  };
+  walk(treeOid, "");
+  return out;
+}
+
+interface DirNode {
+  dirs: Map<string, DirNode>;
+  files: Map<string, FlatEntry>;
+}
+
+/** Build (and store) the tree hierarchy for a flat path map; returns the root tree oid. */
+export function buildTreeFromPaths(repo: Repo, paths: Map<string, FlatEntry>): string {
+  const root: DirNode = { dirs: new Map(), files: new Map() };
+  for (const [path, entry] of [...paths.entries()].sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0))) {
+    const parts = path.split("/");
+    let node = root;
+    for (let i = 0; i < parts.length - 1; i += 1) {
+      const part = parts[i] as string;
+      let child = node.dirs.get(part);
+      if (!child) {
+        child = { dirs: new Map(), files: new Map() };
+        node.dirs.set(part, child);
+      }
+      node = child;
+    }
+    node.files.set(parts[parts.length - 1] as string, entry);
+  }
+  const build = (node: DirNode): string => {
+    const entries: Array<{ mode: string; name: string; oid: string }> = [];
+    for (const [name, dir] of node.dirs) entries.push({ mode: "40000", name, oid: build(dir) });
+    for (const [name, entry] of node.files) entries.push({ mode: entry.mode, name, oid: entry.oid });
+    // Git sorts tree entries by name, directories as name + "/".
+    entries.sort((a, b) => {
+      const ka = a.mode === "40000" ? `${a.name}/` : a.name;
+      const kb = b.mode === "40000" ? `${b.name}/` : b.name;
+      return ka < kb ? -1 : ka > kb ? 1 : 0;
+    });
+    const parts: Buffer[] = [];
+    for (const entry of entries) {
+      parts.push(Buffer.from(`${entry.mode} ${entry.name}\0`, "utf8"));
+      parts.push(Buffer.from(entry.oid, "hex"));
+    }
+    const data = Buffer.concat(parts);
+    const oid = hashObject("tree", data);
+    if (!repo.objects.has(oid)) repo.objects.set(oid, { type: "tree", data });
+    return oid;
+  };
+  return build(root);
+}
+
+/** The oid of the subtree at `dirPath` under a root tree, or null. */
+export function subtreeOid(repo: Repo, treeOid: string, dirPath: string): string | null {
+  if (dirPath === "") return treeOid;
+  let current = treeOid;
+  for (const part of dirPath.split("/")) {
+    const obj = repo.objects.get(current);
+    if (!obj || obj.type !== "tree") return null;
+    const entry = parseTree(obj.data).find((e) => e.name === part && e.mode === "40000");
+    if (!entry) return null;
+    current = entry.oid;
+  }
+  return current;
+}
+
+/** Create and store a commit object with a deterministic identity; returns its oid. */
+export function buildCommit(
+  repo: Repo,
+  treeOid: string,
+  parents: string[],
+  message: string,
+  epochSec: number,
+): string {
+  const ident = `Conformance <conformance@make.fun> ${epochSec} +0000`;
+  let text = `tree ${treeOid}\n`;
+  for (const parent of parents) text += `parent ${parent}\n`;
+  text += `author ${ident}\ncommitter ${ident}\n\n${message}`;
+  const data = Buffer.from(text, "utf8");
+  const oid = hashObject("commit", data);
+  if (!repo.objects.has(oid)) repo.objects.set(oid, { type: "commit", data });
+  return oid;
+}
+
+/** Commit oids reachable from `tip`, newest first (depth-first, parents in order). */
+export function commitHistory(repo: Repo, tip: string): string[] {
+  const out: string[] = [];
+  const seen = new Set<string>();
+  const stack: string[] = [tip];
+  while (stack.length > 0) {
+    const oid = stack.pop() as string;
+    if (seen.has(oid)) continue;
+    seen.add(oid);
+    const obj = repo.objects.get(oid);
+    if (!obj || obj.type !== "commit") continue;
+    out.push(oid);
+    const parents = parseCommit(obj.data).parents;
+    for (let i = parents.length - 1; i >= 0; i -= 1) stack.push(parents[i] as string);
+  }
+  return out;
+}
+
+/** The newest common ancestor of two commits, or null when they share none. */
+export function mergeBase(repo: Repo, a: string, b: string): string | null {
+  const ancestorsB = new Set<string>(commitHistory(repo, b));
+  for (const oid of commitHistory(repo, a)) {
+    if (ancestorsB.has(oid)) return oid;
+  }
+  return null;
+}
+
+function splitLines(text: string): string[] {
+  if (text === "") return [];
+  const lines = text.split("\n");
+  if (lines.length > 0 && lines[lines.length - 1] === "") lines.pop();
+  return lines;
+}
+
+/** Line-diff stats between two text blobs (LCS over lines). */
+export function lineDiffStats(oldText: string, newText: string): { additions: number; deletions: number } {
+  const oldLines = splitLines(oldText);
+  const newLines = splitLines(newText);
+  const m = oldLines.length;
+  const n = newLines.length;
+  let prev = new Array<number>(n + 1).fill(0);
+  let cur = new Array<number>(n + 1).fill(0);
+  for (let i = 1; i <= m; i += 1) {
+    for (let j = 1; j <= n; j += 1) {
+      cur[j] = oldLines[i - 1] === newLines[j - 1] ? prev[j - 1] + 1 : Math.max(prev[j], cur[j - 1]);
+    }
+    const tmp = prev;
+    prev = cur;
+    cur = tmp;
+    cur.fill(0);
+  }
+  const lcs = prev[n] ?? 0;
+  return { additions: n - lcs, deletions: m - lcs };
+}
+
+export interface FileChange {
+  filename: string;
+  status: "added" | "removed" | "modified";
+  additions: number;
+  deletions: number;
+}
+
+/** Changed files between two trees (base -> head), sorted by filename. */
+export function diffTrees(
+  repo: Repo,
+  baseTreeOid: string | null,
+  headTreeOid: string | null,
+): FileChange[] {
+  const base = baseTreeOid ? flattenTree(repo, baseTreeOid) : new Map<string, FlatEntry>();
+  const head = headTreeOid ? flattenTree(repo, headTreeOid) : new Map<string, FlatEntry>();
+  const paths = new Set<string>([...base.keys(), ...head.keys()]);
+  const out: FileChange[] = [];
+  for (const path of [...paths].sort()) {
+    const b = base.get(path);
+    const h = head.get(path);
+    if (b && h) {
+      if (b.oid === h.oid && b.mode === h.mode) continue;
+      const oldText = repo.objects.get(b.oid)?.data.toString("utf8") ?? "";
+      const newText = repo.objects.get(h.oid)?.data.toString("utf8") ?? "";
+      const stats = lineDiffStats(oldText, newText);
+      out.push({ filename: path, status: "modified", additions: stats.additions, deletions: stats.deletions });
+    } else if (h) {
+      const newText = repo.objects.get(h.oid)?.data.toString("utf8") ?? "";
+      out.push({ filename: path, status: "added", additions: splitLines(newText).length, deletions: 0 });
+    } else if (b) {
+      const oldText = repo.objects.get(b.oid)?.data.toString("utf8") ?? "";
+      out.push({ filename: path, status: "removed", additions: 0, deletions: splitLines(oldText).length });
+    }
+  }
+  return out;
+}
+
+/**
+ * Three-way merge of flat path maps (merge-base, head, current base tip).
+ * A path both sides changed differently is a conflict; the merge is null then.
+ */
+export function threeWayMerge(
+  base: Map<string, FlatEntry>,
+  head: Map<string, FlatEntry>,
+  tip: Map<string, FlatEntry>,
+): { merged: Map<string, FlatEntry> | null; conflicts: string[] } {
+  const same = (a: FlatEntry | undefined, b: FlatEntry | undefined): boolean => {
+    if (a === undefined && b === undefined) return true;
+    if (a === undefined || b === undefined) return false;
+    return a.mode === b.mode && a.oid === b.oid;
+  };
+  const merged = new Map<string, FlatEntry>();
+  const conflicts: string[] = [];
+  const paths = new Set<string>([...base.keys(), ...head.keys(), ...tip.keys()]);
+  for (const path of [...paths].sort()) {
+    const b = base.get(path);
+    const h = head.get(path);
+    const t = tip.get(path);
+    if (same(h, t)) {
+      if (h !== undefined) merged.set(path, h);
+    } else if (same(b, h)) {
+      if (t !== undefined) merged.set(path, t);
+    } else if (same(b, t)) {
+      if (h !== undefined) merged.set(path, h);
+    } else {
+      conflicts.push(path);
+    }
+  }
+  return { merged: conflicts.length > 0 ? null : merged, conflicts };
+}
