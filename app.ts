@@ -15,6 +15,8 @@ import {
 } from "./git.ts";
 import { readBody, sendJson, sendRaw } from "./http-util.ts";
 import { handleRest } from "./rest.ts";
+import { handleGraphQL } from "./graphql.ts";
+import { handleMcp } from "./mcp.ts";
 
 export interface Forge {
   server: ReturnType<typeof createServer>;
@@ -59,6 +61,18 @@ async function handleRequest(store: Store, req: IncomingMessage, res: ServerResp
       return;
     }
     sendJson(res, store, 404, { message: "Not Found" });
+    return;
+  }
+
+  // GraphQL (before the /api/v3/ REST dispatch).
+  if (method === "POST" && (path === "/api/graphql" || path === "/graphql")) {
+    await handleGraphQL(store, req, res);
+    return;
+  }
+
+  // MCP (JSON-RPC 2.0 over Streamable HTTP).
+  if (path === "/mcp") {
+    await handleMcp(store, req, res);
     return;
   }
 

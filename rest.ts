@@ -9,6 +9,7 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { Store, trialNowEpochSec, trialNowIso } from "./store.ts";
 import type { Issue, IssueComment, Label, Pull, Repo } from "./store.ts";
+import { viewerLogin } from "./scenario.ts";
 import {
   buildCommit,
   buildTreeFromPaths,
@@ -31,7 +32,7 @@ const SHA40 = /^[0-9a-f]{40}$/i;
 // Serializers (extra fields are allowed by the suite's shape checks)
 // ---------------------------------------------------------------------------
 
-function repoJson(repo: Repo): Record<string, unknown> {
+export function repoJson(repo: Repo): Record<string, unknown> {
   const owner = repo.owner ?? "";
   let openCount = 0;
   for (const issue of repo.issues.values()) if (issue.state === "open") openCount += 1;
@@ -71,7 +72,7 @@ function repoJson(repo: Repo): Record<string, unknown> {
   };
 }
 
-function labelJson(label: Label): Record<string, unknown> {
+export function labelJson(label: Label): Record<string, unknown> {
   return {
     id: label.id,
     node_id: `L_${label.id}`,
@@ -83,7 +84,7 @@ function labelJson(label: Label): Record<string, unknown> {
   };
 }
 
-function issueJson(repo: Repo, issue: Issue): Record<string, unknown> {
+export function issueJson(repo: Repo, issue: Issue): Record<string, unknown> {
   const owner = repo.owner ?? "";
   return {
     id: issue.id,
@@ -106,7 +107,7 @@ function issueJson(repo: Repo, issue: Issue): Record<string, unknown> {
   };
 }
 
-function commentJson(repo: Repo, issue: Issue, comment: IssueComment): Record<string, unknown> {
+export function commentJson(repo: Repo, issue: Issue, comment: IssueComment): Record<string, unknown> {
   const owner = repo.owner ?? "";
   return {
     id: comment.id,
@@ -120,7 +121,7 @@ function commentJson(repo: Repo, issue: Issue, comment: IssueComment): Record<st
   };
 }
 
-function pullJson(repo: Repo, pull: Pull): Record<string, unknown> {
+export function pullJson(repo: Repo, pull: Pull): Record<string, unknown> {
   const owner = repo.owner ?? "";
   const headSha = repo.refs.get(`refs/heads/${pull.headRef}`) ?? pull.headSha;
   const baseSha = repo.refs.get(`refs/heads/${pull.baseRef}`) ?? pull.baseSha;
@@ -263,6 +264,24 @@ async function routeRest(
     return;
   }
 
+  // GET /api/v3/user — the token owner's identity (scenario viewer).
+  if (rest.length === 1 && rest[0] === "user") {
+    if (method !== "GET") throw new HttpError(404, "Not Found");
+    const viewer = viewerLogin();
+    sendJson(res, store, 200, {
+      login: viewer,
+      id: 1000,
+      node_id: "U_1000",
+      type: "User",
+      site_admin: false,
+      name: viewer,
+      email: `${viewer}@example.invalid`,
+      html_url: `https://github.com/${viewer}`,
+      url: "/api/v3/user",
+    });
+    return;
+  }
+
   // /api/v3/user/repos
   if (rest.length === 2 && rest[0] === "user" && rest[1] === "repos") {
     if (method === "GET") {
@@ -320,6 +339,16 @@ async function routeRest(
       throw new HttpError(404, "Not Found");
     }
 
+    // GET /api/v3/repos/{o}/{r}/branches/{branch}
+    if (tail.length === 2 && tail[0] === "branches") {
+      if (method !== "GET") throw new HttpError(404, "Not Found");
+      const branch = decodeURIComponent(tail[1]);
+      const sha = repo.refs.get(`refs/heads/${branch}`);
+      if (!sha) throw new HttpError(404, "Not Found");
+      sendJson(res, store, 200, { name: branch, commit: { sha }, protected: false });
+      return;
+    }
+
     // GET /api/v3/repos/{o}/{r}/branches
     if (tail.length === 1 && tail[0] === "branches") {
       if (method !== "GET") throw new HttpError(404, "Not Found");
@@ -354,6 +383,19 @@ async function routeRest(
       });
       const { page, link } = paginate(commits, url, req);
       sendJson(res, store, 200, page, linkHeader(link));
+      return;
+    }
+
+    // GET /api/v3/repos/{o}/{r}/git/refs/heads/{branch}
+    if (tail.length === 4 && tail[0] === "git" && tail[1] === "refs" && tail[2] === "heads") {
+      if (method !== "GET") throw new HttpError(404, "Not Found");
+      const branch = decodeURIComponent(tail[3]);
+      const sha = repo.refs.get(`refs/heads/${branch}`);
+      if (!sha) throw new HttpError(404, "Not Found");
+      sendJson(res, store, 200, {
+        ref: `refs/heads/${branch}`,
+        object: { sha, type: "commit" },
+      });
       return;
     }
 
@@ -454,13 +496,12 @@ async function routeRest(
         }
         if (method === "POST") {
           const body = await readJsonBody(req);
-          const comment: IssueComment = {
-            id: store.nextSeq(),
-            body: typeof body.body === "string" ? body.body : "",
-            userLogin: repo.owner ?? "",
-            createdSeq: store.nextSeq(),
-          };
-          issue.comments.push(comment);
+          const comment = addCommentRecord(
+            store,
+            repo,
+            issue,
+            typeof body.body === "string" ? body.body : "",
+          );
           sendJson(res, store, 201, commentJson(repo, issue, comment));
           return;
         }
@@ -667,6 +708,182 @@ async function deleteContents(
 }
 
 // ---------------------------------------------------------------------------
+// Shared services (used by REST, GraphQL and MCP — one store, three surfaces)
+// ---------------------------------------------------------------------------
+
+/** Create an issue record; throws 422 when a named label does not exist. */
+export function createIssueRecord(
+  store: Store,
+  repo: Repo,
+  title: string,
+  body: string,
+  labelNames: string[],
+): Issue {
+  const labels: Label[] = [];
+  for (const name of labelNames) {
+    if (name === "") continue;
+    const label = repo.labels.get(name);
+    if (!label) throw new HttpError(422, `Label ${name} does not exist`);
+    labels.push(label);
+  }
+  const number = repo.numberSeq;
+  repo.numberSeq += 1;
+  const issue: Issue = {
+    id: store.nextSeq(),
+    number,
+    title,
+    body,
+    state: "open",
+    labels,
+    comments: [],
+    createdSeq: store.nextSeq(),
+    userLogin: repo.owner ?? "",
+  };
+  repo.issues.set(number, issue);
+  return issue;
+}
+
+/** Append a comment to an issue. */
+export function addCommentRecord(
+  store: Store,
+  repo: Repo,
+  issue: Issue,
+  body: string,
+): IssueComment {
+  const comment: IssueComment = {
+    id: store.nextSeq(),
+    body,
+    userLogin: repo.owner ?? "",
+    createdSeq: store.nextSeq(),
+  };
+  issue.comments.push(comment);
+  return comment;
+}
+
+/** Create a pull request record; throws 422 when a branch does not exist. */
+export function createPullRecord(
+  store: Store,
+  repo: Repo,
+  head: string,
+  base: string,
+  title: string,
+  body: string,
+): Pull {
+  const headSha = repo.refs.get(`refs/heads/${head}`);
+  const baseSha = repo.refs.get(`refs/heads/${base}`);
+  if (!headSha || !baseSha) throw new HttpError(422, "head or base branch does not exist");
+  const number = repo.numberSeq;
+  repo.numberSeq += 1;
+  const pull: Pull = {
+    id: store.nextSeq(),
+    number,
+    title,
+    body,
+    state: "open",
+    headRef: head,
+    headSha,
+    baseRef: base,
+    baseSha,
+    merged: false,
+    mergedAt: null,
+    mergeCommitSha: null,
+    createdSeq: store.nextSeq(),
+    userLogin: repo.owner ?? "",
+  };
+  repo.pulls.set(number, pull);
+  return pull;
+}
+
+/** The changed files of a pull request (base..head diff), sorted by path. */
+export function pullChangedFiles(
+  store: Store,
+  repo: Repo,
+  pull: Pull,
+): Array<Record<string, unknown>> {
+  const headTip = repo.refs.get(`refs/heads/${pull.headRef}`) ?? pull.headSha;
+  const baseTip = repo.refs.get(`refs/heads/${pull.baseRef}`) ?? pull.baseSha;
+  const base = mergeBase(repo, headTip, baseTip);
+  const baseTree = base
+    ? parseCommit((repo.objects.get(base) as { data: Buffer }).data).tree
+    : null;
+  const headObj = repo.objects.get(headTip);
+  if (!headObj || headObj.type !== "commit") throw new HttpError(404, "Not Found");
+  const headTree = parseCommit(headObj.data).tree;
+  const changes = diffTrees(repo, baseTree, headTree);
+  return changes.map((c) => ({
+    filename: c.filename,
+    status: c.status,
+    additions: c.additions,
+    deletions: c.deletions,
+    changes: c.additions + c.deletions,
+  }));
+}
+
+/** Whether a pull request merges cleanly, from the same three-way merge the merge uses. */
+export function mergeableState(
+  store: Store,
+  repo: Repo,
+  pull: Pull,
+): "MERGEABLE" | "CONFLICTING" | "UNKNOWN" {
+  const headTip = repo.refs.get(`refs/heads/${pull.headRef}`) ?? pull.headSha;
+  const baseTip = repo.refs.get(`refs/heads/${pull.baseRef}`) ?? pull.baseSha;
+  const headObj = repo.objects.get(headTip);
+  const baseObj = repo.objects.get(baseTip);
+  if (!headObj || headObj.type !== "commit" || !baseObj || baseObj.type !== "commit") {
+    return "UNKNOWN";
+  }
+  const base = mergeBase(repo, headTip, baseTip);
+  const baseTree = base
+    ? parseCommit((repo.objects.get(base) as { data: Buffer }).data).tree
+    : null;
+  const baseFlat = baseTree ? flattenTree(repo, baseTree) : new Map<string, FlatEntry>();
+  const headFlat = flattenTree(repo, parseCommit(headObj.data).tree);
+  const tipFlat = flattenTree(repo, parseCommit(baseObj.data).tree);
+  const { merged } = threeWayMerge(baseFlat, headFlat, tipFlat);
+  return merged ? "MERGEABLE" : "CONFLICTING";
+}
+
+/** Squash-merge a pull request: three-way tree merge, deterministic commit. */
+export function squashMergeRecord(
+  store: Store,
+  repo: Repo,
+  pull: Pull,
+): { sha: string; message: string } {
+  if (pull.merged || pull.state === "closed") {
+    throw new HttpError(405, "Pull request has already been merged");
+  }
+  const headTip = repo.refs.get(`refs/heads/${pull.headRef}`) ?? pull.headSha;
+  const baseTip = repo.refs.get(`refs/heads/${pull.baseRef}`);
+  if (!baseTip) throw new HttpError(404, "Not Found");
+  const headObj = repo.objects.get(headTip);
+  const baseObj = repo.objects.get(baseTip);
+  if (!headObj || headObj.type !== "commit" || !baseObj || baseObj.type !== "commit") {
+    throw new HttpError(404, "Not Found");
+  }
+  const base = mergeBase(repo, headTip, baseTip);
+  const baseTree = base
+    ? parseCommit((repo.objects.get(base) as { data: Buffer }).data).tree
+    : null;
+  const baseFlat = baseTree ? flattenTree(repo, baseTree) : new Map<string, FlatEntry>();
+  const headFlat = flattenTree(repo, parseCommit(headObj.data).tree);
+  const tipFlat = flattenTree(repo, parseCommit(baseObj.data).tree);
+  const { merged, conflicts } = threeWayMerge(baseFlat, headFlat, tipFlat);
+  if (!merged) {
+    throw new HttpError(405, `Merge conflict in ${conflicts.join(", ")}`);
+  }
+  const newTree = buildTreeFromPaths(repo, merged);
+  const message = `Merge pull request #${pull.number}: ${pull.title}`;
+  const squashSha = buildCommit(repo, newTree, [baseTip], message, trialNowEpochSec());
+  repo.refs.set(`refs/heads/${pull.baseRef}`, squashSha);
+  pull.state = "closed";
+  pull.merged = true;
+  pull.mergedAt = trialNowIso();
+  pull.mergeCommitSha = squashSha;
+  pull.baseSha = squashSha;
+  return { sha: squashSha, message };
+}
+
+// ---------------------------------------------------------------------------
 // Issues
 // ---------------------------------------------------------------------------
 
@@ -680,7 +897,7 @@ async function createIssue(
   const title = typeof body.title === "string" ? body.title : "";
   const issueBody = typeof body.body === "string" ? body.body : "";
   const rawLabels = Array.isArray(body.labels) ? body.labels : [];
-  const labels: Label[] = [];
+  const labelNames: string[] = [];
   for (const item of rawLabels) {
     const name =
       typeof item === "string"
@@ -688,25 +905,9 @@ async function createIssue(
         : typeof (item as Record<string, unknown> | null)?.name === "string"
           ? ((item as Record<string, unknown>).name as string)
           : "";
-    if (name === "") continue;
-    const label = repo.labels.get(name);
-    if (!label) throw new HttpError(422, `Label ${name} does not exist`);
-    labels.push(label);
+    if (name !== "") labelNames.push(name);
   }
-  const number = repo.numberSeq;
-  repo.numberSeq += 1;
-  const issue: Issue = {
-    id: store.nextSeq(),
-    number,
-    title,
-    body: issueBody,
-    state: "open",
-    labels,
-    comments: [],
-    createdSeq: store.nextSeq(),
-    userLogin: repo.owner ?? "",
-  };
-  repo.issues.set(number, issue);
+  const issue = createIssueRecord(store, repo, title, issueBody, labelNames);
   sendJson(res, store, 201, issueJson(repo, issue));
 }
 
@@ -748,28 +949,7 @@ async function createPull(
     typeof body.base === "string" && body.base !== "" ? body.base : repo.defaultBranch;
   const title = typeof body.title === "string" ? body.title : "";
   const pullBody = typeof body.body === "string" ? body.body : "";
-  const headSha = repo.refs.get(`refs/heads/${head}`);
-  const baseSha = repo.refs.get(`refs/heads/${base}`);
-  if (!headSha || !baseSha) throw new HttpError(422, "head or base branch does not exist");
-  const number = repo.numberSeq;
-  repo.numberSeq += 1;
-  const pull: Pull = {
-    id: store.nextSeq(),
-    number,
-    title,
-    body: pullBody,
-    state: "open",
-    headRef: head,
-    headSha,
-    baseRef: base,
-    baseSha,
-    merged: false,
-    mergedAt: null,
-    mergeCommitSha: null,
-    createdSeq: store.nextSeq(),
-    userLogin: repo.owner ?? "",
-  };
-  repo.pulls.set(number, pull);
+  const pull = createPullRecord(store, repo, head, base, title, pullBody);
   sendJson(res, store, 201, pullJson(repo, pull));
 }
 
@@ -795,28 +975,7 @@ async function listPullFiles(
   repo: Repo,
   pull: Pull,
 ): Promise<void> {
-  const headTip = repo.refs.get(`refs/heads/${pull.headRef}`) ?? pull.headSha;
-  const baseTip = repo.refs.get(`refs/heads/${pull.baseRef}`) ?? pull.baseSha;
-  const base = mergeBase(repo, headTip, baseTip);
-  const baseTree = base
-    ? parseCommit((repo.objects.get(base) as { data: Buffer }).data).tree
-    : null;
-  const headObj = repo.objects.get(headTip);
-  if (!headObj || headObj.type !== "commit") throw new HttpError(404, "Not Found");
-  const headTree = parseCommit(headObj.data).tree;
-  const changes = diffTrees(repo, baseTree, headTree);
-  sendJson(
-    res,
-    store,
-    200,
-    changes.map((c) => ({
-      filename: c.filename,
-      status: c.status,
-      additions: c.additions,
-      deletions: c.deletions,
-      changes: c.additions + c.deletions,
-    })),
-  );
+  sendJson(res, store, 200, pullChangedFiles(store, repo, pull));
 }
 
 /** Squash-merge a pull request: three-way tree merge, deterministic commit. */
@@ -827,37 +986,7 @@ async function mergePull(
   repo: Repo,
   pull: Pull,
 ): Promise<void> {
-  if (pull.merged || pull.state === "closed") {
-    throw new HttpError(405, "Pull request has already been merged");
-  }
   await readJsonBody(req); // body carries merge_method; any method merges as squash
-  const headTip = repo.refs.get(`refs/heads/${pull.headRef}`) ?? pull.headSha;
-  const baseTip = repo.refs.get(`refs/heads/${pull.baseRef}`);
-  if (!baseTip) throw new HttpError(404, "Not Found");
-  const headObj = repo.objects.get(headTip);
-  const baseObj = repo.objects.get(baseTip);
-  if (!headObj || headObj.type !== "commit" || !baseObj || baseObj.type !== "commit") {
-    throw new HttpError(404, "Not Found");
-  }
-  const base = mergeBase(repo, headTip, baseTip);
-  const baseTree = base
-    ? parseCommit((repo.objects.get(base) as { data: Buffer }).data).tree
-    : null;
-  const baseFlat = baseTree ? flattenTree(repo, baseTree) : new Map<string, FlatEntry>();
-  const headFlat = flattenTree(repo, parseCommit(headObj.data).tree);
-  const tipFlat = flattenTree(repo, parseCommit(baseObj.data).tree);
-  const { merged, conflicts } = threeWayMerge(baseFlat, headFlat, tipFlat);
-  if (!merged) {
-    throw new HttpError(405, `Merge conflict in ${conflicts.join(", ")}`);
-  }
-  const newTree = buildTreeFromPaths(repo, merged);
-  const message = `Merge pull request #${pull.number}: ${pull.title}`;
-  const squashSha = buildCommit(repo, newTree, [baseTip], message, trialNowEpochSec());
-  repo.refs.set(`refs/heads/${pull.baseRef}`, squashSha);
-  pull.state = "closed";
-  pull.merged = true;
-  pull.mergedAt = trialNowIso();
-  pull.mergeCommitSha = squashSha;
-  pull.baseSha = squashSha;
-  sendJson(res, store, 200, { sha: squashSha, merged: true, message });
+  const { sha, message } = squashMergeRecord(store, repo, pull);
+  sendJson(res, store, 200, { sha, merged: true, message });
 }
