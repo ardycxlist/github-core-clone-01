@@ -14,6 +14,9 @@ export type GitObjectType = "commit" | "tree" | "blob" | "tag";
 export interface GitObject {
   type: GitObjectType;
   data: Buffer;
+  /** Lazy pre-compressed payload (deflate of data). Pure function of data;
+   *  filled on first pack and reused by every later pack — never affects bytes. */
+  deflated?: Buffer;
 }
 
 export interface Label {
@@ -40,6 +43,10 @@ export interface Issue {
   comments: IssueComment[];
   createdSeq: number;
   userLogin: string;
+  /** Pre-serialized issueJson body. Valid only while gen === repo.issueGen;
+   *  any issue/label/comment mutation bumps repo.issueGen, so a stale entry
+   *  is never served. The body is a pure function of the issue + repo owner. */
+  cachedJson?: { gen: number; buf: Buffer };
 }
 
 export interface Pull {
@@ -74,6 +81,17 @@ export interface Repo {
   pulls: Map<number, Pull>;
   /** Next issue/PR number (one shared counter, GitHub semantics). */
   numberSeq: number;
+  /** Generation bumped on ANY issue/label/comment mutation in this repo.
+   *  Cached issue JSON (single + list) is valid only at the generation it
+   *  was serialized at, so invalidation is exact and per-repo. */
+  issueGen: number;
+  /** Pre-serialized issue-list pages, keyed by "state|sort|direction|page|perPage". */
+  issueListCache: Map<string, { gen: number; buf: Buffer }>;
+  /** Cached full upload-pack fetch responses, keyed by a content-derived
+   *  string (object count + wants + haves + shallow + depth). Values are
+   *  byte-identical to a fresh computation; a miss recomputes the same bytes.
+   *  LRU-capped (64 entries) — eviction only costs performance, never bytes. */
+  fetchCache: Map<string, Buffer>;
 }
 
 /**
@@ -162,6 +180,9 @@ export class Store {
       issues: new Map(),
       pulls: new Map(),
       numberSeq: 1,
+      issueGen: 0,
+      issueListCache: new Map(),
+      fetchCache: new Map(),
     };
     this.repoSeq += 1;
     this.reposByName.set(name, repo);

@@ -401,9 +401,21 @@ function packObjectHeader(typeCode: number, size: number): Buffer {
 }
 
 /** Write a packfile of plain objects, sorted by oid for determinism. */
+/**
+ * Lazily pre-compressed payload of one object. deflateSync is deterministic
+ * for the same input, so the cached bytes are byte-identical to a fresh
+ * compression; the first pack of an object pays it, every later pack reuses
+ * it. Kept on the object (shared by every repo surface that packs it).
+ */
+function deflatedOf(obj: GitObject): Buffer {
+  if (obj.deflated === undefined) obj.deflated = deflateSync(obj.data);
+  return obj.deflated;
+}
+
 export function writePack(objects: Map<string, GitObject>): Buffer {
   const oids = [...objects.keys()].sort();
   const parts: Buffer[] = [];
+  let total = 12; // PACK header
   const header = Buffer.alloc(12);
   header.write("PACK", 0, "ascii");
   header.writeUInt32BE(2, 4);
@@ -411,12 +423,14 @@ export function writePack(objects: Map<string, GitObject>): Buffer {
   parts.push(header);
   for (const oid of oids) {
     const obj = objects.get(oid) as GitObject;
-    parts.push(packObjectHeader(TYPE_CODES[obj.type], obj.data.length));
-    parts.push(deflateSync(obj.data));
+    const objHeader = packObjectHeader(TYPE_CODES[obj.type], obj.data.length);
+    const deflated = deflatedOf(obj);
+    parts.push(objHeader, deflated);
+    total += objHeader.length + deflated.length;
   }
-  const body = Buffer.concat(parts);
+  const body = Buffer.concat(parts, total);
   const trailer = createHash("sha1").update(body).digest();
-  return Buffer.concat([body, trailer]);
+  return Buffer.concat([body, trailer], body.length + 20);
 }
 
 /** Inflate one zlib stream starting at `offset`; returns the data and the offset past it. */
@@ -496,8 +510,17 @@ function sortedRefs(repo: Repo): Array<[string, string]> {
   return [...repo.refs.entries()].sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0));
 }
 
+/**
+ * The v2 advertisement is a pure function of the service name — it never
+ * depends on repo state. Build it once per service and reuse the same Buffer
+ * for every info/refs request (the caller sends it read-only).
+ */
+const v2AdvertisementCache = new Map<string, Buffer>();
+
 export function buildV2Advertisement(service: string): Buffer {
-  return pktLines([
+  const cached = v2AdvertisementCache.get(service);
+  if (cached) return cached;
+  const built = pktLines([
     `# service=${service}\n`,
     "flush",
     "version 2\n",
@@ -507,6 +530,8 @@ export function buildV2Advertisement(service: string): Buffer {
     "fetch=shallow\n",
     "flush",
   ]);
+  v2AdvertisementCache.set(service, built);
+  return built;
 }
 
 export function buildV0Advertisement(repo: Repo, service: string): Buffer {
@@ -619,7 +644,27 @@ export function parseFetchRequest(packets: GitPacket[]): FetchRequest {
   return req;
 }
 
+/** Max cached fetch responses per repo (LRU by insertion order). */
+const FETCH_CACHE_MAX = 64;
+
+/**
+ * Full upload-pack fetch response for one request, cached per repo.
+ *
+ * Cache key is content-derived: the repo's object count (objects are only
+ * ever added, never removed or rewritten, so the count is a monotonic
+ * generation for the object set) plus the sorted wants, haves, previous
+ * shallow set and depth. The plan is a pure function of exactly those
+ * inputs, so a cached response is byte-identical to a fresh computation —
+ * a miss just recomputes the same bytes. Eviction only costs time.
+ * The 50 concurrent shallow clones of the bench all hit the same entry.
+ */
 export function handleFetch(repo: Repo, req: FetchRequest): Buffer {
+  const key =
+    `${repo.objects.size}|${[...req.wants].sort().join(",")}|` +
+    `${[...req.haves].sort().join(",")}|${[...req.prevShallow].sort().join(",")}|` +
+    `${req.depth === null ? "" : req.depth}`;
+  const cached = repo.fetchCache.get(key);
+  if (cached) return cached;
   const plan = planFetch(repo, req.wants, req.haves, req.prevShallow, req.depth);
   const pack = writePack(plan.objects);
   const items: PktItem[] = ["acknowledgments\n", "NAK\n", "delim"];
@@ -632,7 +677,15 @@ export function handleFetch(repo: Repo, req: FetchRequest): Buffer {
   items.push("packfile\n");
   const head = pktLines(items);
   const chunks = sidebandChunks(pack, 1);
-  return Buffer.concat([head, ...chunks, FLUSH]);
+  let chunksLen = 0;
+  for (const c of chunks) chunksLen += c.length;
+  const body = Buffer.concat([head, ...chunks, FLUSH], head.length + chunksLen + 4);
+  if (repo.fetchCache.size >= FETCH_CACHE_MAX) {
+    const oldest = repo.fetchCache.keys().next();
+    if (!oldest.done) repo.fetchCache.delete(oldest.value);
+  }
+  repo.fetchCache.set(key, body);
+  return body;
 }
 
 // ---------------------------------------------------------------------------

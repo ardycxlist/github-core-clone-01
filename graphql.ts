@@ -19,6 +19,7 @@ import {
   mergeableState,
   pullChangedFiles,
   squashMergeRecord,
+  touchIssues,
 } from "./rest.ts";
 import { HttpError, readBody, requireAuth, sendJson } from "./http-util.ts";
 
@@ -1116,6 +1117,7 @@ function resolveMutation(
     const found = resolveIssueByGlobalId(ctx, input.issueId);
     if (!found) throw new HttpError(404, "Issue not found");
     found.issue.state = "closed";
+    touchIssues(found.repo);
     return { __typename: "CloseIssuePayload", __issue: issueValue(found.issue, found.repo) };
   }
   if (name === "createPullRequest") {

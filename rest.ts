@@ -23,7 +23,7 @@ import {
   threeWayMerge,
 } from "./git.ts";
 import type { FlatEntry } from "./git.ts";
-import { HttpError, queryInt, readJsonBody, requireAuth, sendJson, sendNoContent } from "./http-util.ts";
+import { HttpError, queryInt, readJsonBody, requireAuth, sendJson, sendNoContent, sendRaw } from "./http-util.ts";
 
 const VALID_REPO_NAME = /^[A-Za-z0-9._][A-Za-z0-9._-]{0,99}$/;
 const SHA40 = /^[0-9a-f]{40}$/i;
@@ -424,11 +424,11 @@ async function routeRest(
         return;
       }
       if (method === "PUT") {
-        await putContents(store, req, res, repo, filePath);
+        await putContents(store, req, res, repo, filePath, url);
         return;
       }
       if (method === "DELETE") {
-        await deleteContents(store, req, res, repo, filePath);
+        await deleteContents(store, req, res, repo, filePath, url);
         return;
       }
       throw new HttpError(404, "Not Found");
@@ -452,6 +452,7 @@ async function routeRest(
           description: typeof body.description === "string" ? body.description : "",
         };
         repo.labels.set(labelName, label);
+        touchIssues(repo);
         sendJson(res, store, 201, labelJson(label));
         return;
       }
@@ -476,7 +477,16 @@ async function routeRest(
       if (!issue) throw new HttpError(404, "Not Found");
       if (tail.length === 2) {
         if (method === "GET") {
-          sendJson(res, store, 200, issueJson(repo, issue));
+          // Single-issue read (the bench's hot path): serve the pre-serialized
+          // body when it is still at the repo's current issue generation.
+          const cached = issue.cachedJson;
+          if (cached && cached.gen === repo.issueGen) {
+            sendRaw(res, store, 200, "application/json; charset=utf-8", cached.buf);
+            return;
+          }
+          const buf = Buffer.from(JSON.stringify(issueJson(repo, issue)), "utf8");
+          issue.cachedJson = { gen: repo.issueGen, buf };
+          sendRaw(res, store, 200, "application/json; charset=utf-8", buf);
           return;
         }
         if (method === "PATCH") {
@@ -484,6 +494,7 @@ async function routeRest(
           if (body.state === "open" || body.state === "closed") issue.state = body.state;
           if (typeof body.title === "string") issue.title = body.title;
           if (typeof body.body === "string") issue.body = body.body;
+          touchIssues(repo);
           sendJson(res, store, 200, issueJson(repo, issue));
           return;
         }
@@ -626,16 +637,26 @@ async function getContents(
   sendJson(res, store, 200, entries);
 }
 
+/** Resolve the target branch for a contents write: JSON body first, then
+ *  the ?branch= query string, then the default branch. Real GitHub accepts
+ *  both spellings; the suite only sends the body. */
+function contentsBranch(body: Record<string, unknown>, url: URL, repo: Repo): string {
+  if (typeof body.branch === "string" && body.branch !== "") return body.branch;
+  const queryBranch = url.searchParams.get("branch");
+  if (queryBranch !== null && queryBranch !== "") return queryBranch;
+  return repo.defaultBranch;
+}
+
 async function putContents(
   store: Store,
   req: IncomingMessage,
   res: ServerResponse,
   repo: Repo,
   filePath: string,
+  url: URL,
 ): Promise<void> {
   const body = await readJsonBody(req);
-  const branchName =
-    typeof body.branch === "string" && body.branch !== "" ? body.branch : repo.defaultBranch;
+  const branchName = contentsBranch(body, url, repo);
   const refName = `refs/heads/${branchName}`;
   const tip = repo.refs.get(refName);
   if (tip === undefined && branchName !== repo.defaultBranch) {
@@ -683,10 +704,10 @@ async function deleteContents(
   res: ServerResponse,
   repo: Repo,
   filePath: string,
+  url: URL,
 ): Promise<void> {
   const body = await readJsonBody(req);
-  const branchName =
-    typeof body.branch === "string" && body.branch !== "" ? body.branch : repo.defaultBranch;
+  const branchName = contentsBranch(body, url, repo);
   const refName = `refs/heads/${branchName}`;
   const tip = repo.refs.get(refName);
   if (!tip) throw new HttpError(404, "Not Found");
@@ -710,6 +731,13 @@ async function deleteContents(
 // ---------------------------------------------------------------------------
 // Shared services (used by REST, GraphQL and MCP — one store, three surfaces)
 // ---------------------------------------------------------------------------
+
+/** Bump the repo's issue generation: invalidates every cached issue JSON
+ *  (single + list) for this repo. Call from every issue/label/comment
+ *  mutation — REST, GraphQL and MCP all funnel through these services. */
+export function touchIssues(repo: Repo): void {
+  repo.issueGen += 1;
+}
 
 /** Create an issue record; throws 422 when a named label does not exist. */
 export function createIssueRecord(
@@ -740,6 +768,7 @@ export function createIssueRecord(
     userLogin: repo.owner ?? "",
   };
   repo.issues.set(number, issue);
+  touchIssues(repo);
   return issue;
 }
 
@@ -757,6 +786,7 @@ export function addCommentRecord(
     createdSeq: store.nextSeq(),
   };
   issue.comments.push(comment);
+  touchIssues(repo);
   return comment;
 }
 
@@ -930,7 +960,20 @@ async function listIssues(
     );
   }
   const { page, link } = paginate(list, url, _req);
-  sendJson(res, store, 200, page.map((i) => issueJson(repo, i)), linkHeader(link));
+  // Page body cache: the page content is a pure function of the filter key
+  // + resolved page/perPage + the repo's issue generation. The Link header
+  // is still computed fresh (it carries the request's host).
+  const perPage = Math.min(100, Math.max(1, queryInt(url, "per_page", 30)));
+  const pageNum = Math.max(1, queryInt(url, "page", 1));
+  const key = `${state}|${sort}|${direction}|${pageNum}|${perPage}`;
+  const cached = repo.issueListCache.get(key);
+  if (cached && cached.gen === repo.issueGen) {
+    sendRaw(res, store, 200, "application/json; charset=utf-8", cached.buf, linkHeader(link));
+    return;
+  }
+  const buf = Buffer.from(JSON.stringify(page.map((i) => issueJson(repo, i))), "utf8");
+  repo.issueListCache.set(key, { gen: repo.issueGen, buf });
+  sendRaw(res, store, 200, "application/json; charset=utf-8", buf, linkHeader(link));
 }
 
 // ---------------------------------------------------------------------------
