@@ -1,104 +1,42 @@
-// main.ts — entry <-> env lifecycle.
-//
-//   1. MAKEFUN_ENV_URL names the env's origin. Without it there is nothing
-//      to register with, so the program exits 1 at once.
-//   2. Bind an ephemeral port (listen(0)). Never bind 8080 — the env owns it.
-//   3. POST $MAKEFUN_ENV_URL/register {"port": N}. 200 is normal; 409 means
-//      a first register already won, which is not this process's to fix —
-//      it keeps waiting like any other. 400/405 are contract errors and
-//      end the program; anything else is retried with backoff.
-//   4. GET $MAKEFUN_ENV_URL/done until the body is {"done": true}.
-//   5. Close the server and exit 0.
-//
-// The forge code lives in app.ts / git.ts / store.ts; this file only runs
-// the lifecycle.
+// SPDX-License-Identifier: MIT
+// Raven Forge — entrypoint (M2 rebuild). Starts the server on an ephemeral
+// port, registers it with the environment, polls for completion, exits 0.
+import { createApp } from './server.mjs';
 
-import { Store } from "./store.ts";
-import { createForge } from "./app.ts";
-
-const ENV_URL = (process.env.MAKEFUN_ENV_URL ?? "").replace(/\/+$/, "");
-if (ENV_URL === "") {
-  process.stderr.write("[entry] MAKEFUN_ENV_URL is not set: there is no env to register with\n");
-  process.exit(1);
+const wait = ms => new Promise(r => setTimeout(r, ms));
+const envURL = (process.env.MAKEFUN_ENV_URL ?? '').replace(/\/+$/, '');
+const standalone = process.argv.includes('--standalone');
+if (!envURL && !standalone) { console.error('MAKEFUN_ENV_URL is required (or use --standalone for local tests)'); process.exit(1); }
+const server = createApp();
+await new Promise((resolve, reject) => { server.once('error', reject); server.listen(0, '0.0.0.0', resolve); });
+const address = server.address();
+if (!address || typeof address === 'string') { console.error('server did not bind a TCP port'); process.exit(1); }
+const port = address.port;
+console.log(JSON.stringify({ service: 'raven-forge', port }));
+let stopping = false;
+async function shutdown() {
+  if (stopping) return; stopping = true;
+  server.close(); server.closeIdleConnections();
+  const deadline = setTimeout(() => { server.closeAllConnections(); process.exit(0); }, 2000); deadline.unref();
 }
-
-/** How long one register or done request may take before it is abandoned and retried. */
-const REQUEST_TIMEOUT_MS = 30_000;
-/** The first wait between retries, and the longest. */
-const RETRY_INITIAL_MS = 250;
-const RETRY_MAX_MS = 2_000;
-
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, Math.max(0, ms)));
+process.once('SIGINT', shutdown); process.once('SIGTERM', shutdown);
+async function request(path, init = {}) {
+  return fetch(`${envURL}${path}`, { ...init, signal: AbortSignal.timeout(10000) });
 }
-
-/** The wait after `attempt` failed requests: exponential from RETRY_INITIAL_MS, capped. */
-function retryDelay(attempt: number): number {
-  return Math.min(RETRY_MAX_MS, RETRY_INITIAL_MS * 2 ** Math.min(attempt, 8));
-}
-
-/** POST the bound port until the env accepts it (200 or 409). */
-async function register(port: number): Promise<void> {
-  for (let attempt = 0; ; attempt += 1) {
+if (envURL) {
+  let registered = false;
+  for (let i = 0; i < 20 && !registered; i++) {
     try {
-      const res = await fetch(`${ENV_URL}/register`, {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ port }),
-        signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
-      });
-      if (res.status === 200 || res.status === 409) return;
-      if (res.status === 400 || res.status === 405) {
-        throw new Error(`register answered HTTP ${res.status}: ${await res.text()}`);
-      }
-    } catch (err) {
-      if (err instanceof Error && err.message.startsWith("register answered HTTP ")) throw err;
-    }
-    await sleep(retryDelay(attempt));
+      const r = await request('/register', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ port }) });
+      await r.arrayBuffer();
+      if (r.status === 200 || r.status === 409) registered = true;
+      else if (r.status === 400 || r.status === 405) throw new Error('Invalid registration');
+    } catch (e) { if (e.message === 'Invalid registration') { console.error(e.message); process.exit(1); } }
+    if (!registered) await wait(Math.min(250 * 2 ** i, 2000));
   }
-}
-
-/** Poll GET /done until it answers {"done": true}; never return before that. */
-async function waitForDone(): Promise<void> {
-  for (let attempt = 0; ; attempt += 1) {
-    try {
-      const res = await fetch(`${ENV_URL}/done`, { signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS) });
-      if (res.ok) {
-        const body = (await res.json()) as { done?: unknown };
-        if (body.done === true) return;
-      }
-    } catch {
-      // The env is not answering yet, or the poll timed out: it is not done, so poll again.
-    }
-    await sleep(retryDelay(attempt));
+  if (!registered) { console.error('Registration timed out'); process.exit(1); }
+  while (!stopping) {
+    try { const r = await request('/done'); if (r.ok && (await r.json()).done === true) { await shutdown(); break; } } catch {}
+    await wait(500);
   }
-}
-
-/** Bound the port, register it, then wait for the env: the whole life of the process. */
-async function main(): Promise<void> {
-  const forge = createForge(new Store());
-  await new Promise<void>((resolve, reject) => {
-    forge.server.once("error", reject);
-    forge.server.listen(0, () => resolve());
-  });
-  const address = forge.server.address();
-  if (address === null || typeof address === "string") {
-    throw new Error("the server did not bind an ephemeral TCP port");
-  }
-  process.stdout.write(`[entry] listening on port ${address.port}\n`);
-
-  await register(address.port);
-  process.stdout.write("[entry] registered; waiting for the env to say done\n");
-
-  await waitForDone();
-  forge.server.close();
-  process.stdout.write("[entry] done\n");
-}
-
-try {
-  await main();
-  process.exit(0);
-} catch (err) {
-  process.stderr.write(`[entry] ${err instanceof Error ? err.message : String(err)}\n`);
-  process.exit(1);
 }
